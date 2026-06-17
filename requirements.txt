@@ -1,0 +1,4 @@
+streamlit>=1.40
+requests>=2.31
+websocket-client>=1.7
+pandas>=2.0

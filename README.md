@@ -11,7 +11,32 @@ Hyperdash.
 
 ---
 
-## Auf Streamlit Community Cloud deployen (nur GitHub nötig)
+## Wie Wallets bewertet werden (Qualitäts-Score)
+
+Damit nicht zufällige Glückstrades oder Verlust-Wallets oben landen, bekommt jede
+Wallet einen **Qualitäts-Score (0–100)**. Sortiert wird danach – nicht nach rohem PnL.
+
+**Harte Ausschluss-Gates** (Wallet wird aussortiert, wenn eines verletzt ist):
+- weniger als `MIN_CLOSED_TRIPS` abgeschlossene Trades (Stichprobe zu klein)
+- Historie kürzer als `MIN_ACTIVE_DAYS` (Default 7 Tage)
+- Account-Value unter `MIN_ACCOUNT_VALUE` (Default 5.000 $)
+- netto im Minus über den Zeitraum
+- Profit-Faktor unter `MIN_PROFIT_FACTOR`
+- ein einzelner Trade macht mehr als `MAX_SINGLE_TRADE_SHARE` des Gewinns aus
+  (genau der „500 $ aus einem Trade"-Fall)
+
+**Gewichteter Score** (Reihenfolge nach Priorität: Win-Rate > PnL > Risiko > Konstanz):
+- Win-Rate 40 % – **multipliziert mit einer Stichproben-Konfidenz**, damit eine
+  90 %-Quote aus 6 Trades NICHT über einer soliden 65 %-Quote aus 40 Trades landet
+- Rendite/PnL 30 % (als % auf den Account-Value, gedeckelt)
+- Risiko 20 % (weniger Drawdown = mehr Punkte; erkannte Liquidation drückt hart)
+- Konstanz 10 % (Gewinn breit gestreut + genug Trades + beide Zeitfenster positiv)
+
+Alle Schwellen und Gewichte stehen gebündelt oben in `analysis.py` und lassen sich
+auch live in der Sidebar nachjustieren (Min. Score, Min. Trades, Min. Profit-Faktor,
+„Nur qualitätsgeprüfte Wallets").
+
+
 
 1. **GitHub-Repo anlegen** und alle Dateien dieses Ordners hochladen
    (`app.py`, `collector.py`, `analysis.py`, `api.py`, `requirements.txt`,

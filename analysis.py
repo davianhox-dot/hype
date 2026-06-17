@@ -34,6 +34,35 @@ REST_WINDOW_HOURS = 4              # taegliches Inaktivitaetsfenster (Mensch sch
 # Toleranz, ab wann eine Position als "flat" (geschlossen) gilt.
 FLAT_EPS = 1e-6
 
+# =============================================================================
+# QUALITAETS-GATES (harte Ausschlusskriterien) - hier zentral anpassen
+# =============================================================================
+# Eine Wallet muss ALLE folgenden Huerden bestehen, sonst gilt sie als nicht
+# copy-tradewuerdig (quality_pass = False).
+MIN_CLOSED_TRIPS = 8               # zu wenige abgeschlossene Trades -> Stichprobe wertlos
+MIN_ACTIVE_DAYS = 7                # Historie muss mind. so viele Tage abdecken (= 1 Woche)
+MIN_ACCOUNT_VALUE = 5000.0         # kleinere Konten ignorieren
+MIN_PROFIT_FACTOR = 1.2            # Brutto-Gewinn / Brutto-Verlust muss klar > 1 sein
+MAX_SINGLE_TRADE_SHARE = 0.5       # ein einzelner Trade darf nicht > 50% des Gewinns ausmachen
+REQUIRE_POSITIVE_WINDOW = True     # Netto-PnL im Analysezeitraum muss positiv sein
+
+# =============================================================================
+# QUALITAETS-SCORE (0-100) - Gewichte nach Nutzer-Prioritaet
+# Reihenfolge des Nutzers: 1. Win-Rate, 2. PnL, 3. Risiko, 4. Konstanz
+# =============================================================================
+WEIGHT_WINRATE = 0.40
+WEIGHT_PNL = 0.30
+WEIGHT_RISK = 0.20
+WEIGHT_CONSISTENCY = 0.10
+
+# Ab so vielen abgeschlossenen Trades gilt die Win-Rate als statistisch belastbar.
+# Darunter wird der Win-Rate-Beitrag anteilig gedaempft (Stichproben-Konfidenz).
+CONFIDENCE_TRADES = 30
+# Bei dieser Rendite (% auf Account-Value im Zeitraum) ist der PnL-Beitrag bei 100.
+PNL_ROI_CAP_PCT = 50.0
+# Bei diesem Drawdown (% auf Account-Value) faellt der Risiko-Beitrag auf 0.
+RISK_DD_CAP_PCT = 50.0
+
 
 # =============================================================================
 # Hilfsfunktionen zum Auswerten der Fills
@@ -193,6 +222,105 @@ def classify(metrics: dict) -> str:
 
 
 # =============================================================================
+# Risiko + Qualitaet
+# =============================================================================
+
+def _max_drawdown_pct(trips: list[dict], account_value: float) -> float:
+    """
+    Maximaler Drawdown der realisierten Equity-Kurve (aus geschlossenen Trips),
+    ausgedrueckt in % des aktuellen Account-Value. Naeherung, da wir nur
+    realisierte PnL kennen, kein laufendes Equity-Tracking.
+    """
+    if not trips or account_value <= 0:
+        return 0.0
+    ordered = sorted(trips, key=lambda t: t["close_ts"])
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for t in ordered:
+        cum += t["pnl"]
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)  # absoluter Ruecksetzer vom Hoch
+    return max_dd / account_value * 100.0
+
+
+def _single_trade_share(trips: list[dict]) -> float:
+    """
+    Anteil des groessten Einzelgewinns am gesamten Brutto-Gewinn.
+    Nahe 1.0 -> ein einziger Trade traegt fast den ganzen Gewinn (Glueckstreffer).
+    """
+    wins = [t["pnl"] for t in trips if t["pnl"] > 0]
+    if not wins:
+        return 1.0
+    return max(wins) / sum(wins)
+
+
+def _clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, x))
+
+
+def quality_gate(m: dict) -> tuple[bool, list[str]]:
+    """
+    Harte Ausschlusskriterien. Rueckgabe: (besteht, [gruende_fuer_ausschluss]).
+    Eine Wallet, die hier durchfaellt, ist NICHT copy-tradewuerdig.
+    """
+    reasons = []
+    if m["num_closed_trips"] < MIN_CLOSED_TRIPS:
+        reasons.append(f"zu wenige Trades ({m['num_closed_trips']} < {MIN_CLOSED_TRIPS})")
+    if m["active_days"] < MIN_ACTIVE_DAYS:
+        reasons.append(f"Historie zu kurz ({m['active_days']:.1f}d < {MIN_ACTIVE_DAYS}d)")
+    if m["account_value"] < MIN_ACCOUNT_VALUE:
+        reasons.append(f"Konto zu klein ({m['account_value']:.0f}$ < {MIN_ACCOUNT_VALUE:.0f}$)")
+    if REQUIRE_POSITIVE_WINDOW and m["pnl_window"] <= 0:
+        reasons.append("im Minus / nicht profitabel")
+    if m["profit_factor"] is None or m["profit_factor"] < MIN_PROFIT_FACTOR:
+        pf = "n/a" if m["profit_factor"] is None else f"{m['profit_factor']:.2f}"
+        reasons.append(f"Profit-Faktor zu niedrig ({pf} < {MIN_PROFIT_FACTOR})")
+    if m["single_trade_share"] > MAX_SINGLE_TRADE_SHARE:
+        reasons.append(f"ein Trade dominiert ({m['single_trade_share']*100:.0f}% des Gewinns)")
+    return (len(reasons) == 0, reasons)
+
+
+def quality_score(m: dict) -> float:
+    """
+    Zusammengesetzter Qualitaets-Score 0-100, gewichtet nach Nutzer-Prioritaet:
+    Win-Rate > PnL > Risiko > Konstanz.
+
+    Wichtig: Die Win-Rate wird mit einer Stichproben-Konfidenz multipliziert, damit
+    eine 90%-Quote aus nur 6 Trades NICHT ueber einer soliden 65%-Quote aus 40
+    Trades landet. So bleibt die Win-Rate die wichtigste Groesse, ohne dass
+    Gluecksstichproben gewinnen.
+    """
+    # 1) Win-Rate mit Konfidenz
+    wr = m["win_rate"] if m["win_rate"] is not None else 0.0
+    confidence = min(1.0, m["num_closed_trips"] / CONFIDENCE_TRADES)
+    win_component = _clamp(wr * confidence)
+
+    # 2) PnL als Rendite (% auf Account-Value), gedeckelt
+    roi = m["roi_pct"]
+    pnl_component = _clamp(roi / PNL_ROI_CAP_PCT * 100.0)
+
+    # 3) Risiko: weniger Drawdown = mehr Punkte; Liquidation deckelt hart
+    risk_component = _clamp(100.0 - m["max_drawdown_pct"] / RISK_DD_CAP_PCT * 100.0)
+    if m["had_liquidation"]:
+        risk_component = min(risk_component, 20.0)
+
+    # 4) Konstanz: Gewinn breit gestreut + genug Trades + beide Zeitfenster positiv
+    spread = _clamp((1.0 - m["single_trade_share"]) * 100.0)
+    count = _clamp(m["num_closed_trips"] / CONFIDENCE_TRADES * 100.0)
+    both_windows = 100.0 if (m["pnl_7d"] >= 0 and m["pnl_30d"] > 0) else 50.0
+    consistency_component = _clamp(0.5 * spread + 0.3 * count + 0.2 * both_windows)
+
+    total = (
+        WEIGHT_WINRATE * win_component
+        + WEIGHT_PNL * pnl_component
+        + WEIGHT_RISK * risk_component
+        + WEIGHT_CONSISTENCY * consistency_component
+    )
+    return round(total, 1)
+
+
+# =============================================================================
 # Vollstaendiges Trader-Profil (Hyperdash-artig)
 # =============================================================================
 
@@ -270,6 +398,24 @@ def build_profile(address: str) -> dict:
         max_concurrent = _max_concurrent_markets(trips)
         has_rest = _has_daily_rest_window(fills)
 
+        # --- Qualitaets-Metriken ---
+        # Abgedeckte Historie in Tagen (erster bis letzter Fill).
+        if times and times[-1] > times[0]:
+            active_days = (times[-1] - times[0]) / (24 * 3600 * 1000.0)
+        else:
+            active_days = 0.0
+
+        # Rendite im Zeitraum relativ zum aktuellen Account-Value.
+        roi_pct = (pnl_total_window / account_value * 100.0) if account_value > 0 else 0.0
+
+        max_dd_pct = _max_drawdown_pct(trips, account_value)
+        single_share = _single_trade_share(trips)
+
+        # Wurde die Wallet im Zeitraum liquidiert? (Heuristik auf dem dir-Feld)
+        had_liquidation = any(
+            "liquidat" in str(f.get("dir", "")).lower() for f in fills
+        )
+
         metrics = {
             "num_fills": num_fills,
             "num_trips": len(trips),
@@ -280,6 +426,24 @@ def build_profile(address: str) -> dict:
             "has_rest_window": has_rest,
         }
         klassifizierung = classify(metrics)
+
+        # --- Qualitaets-Gate + Score ---
+        qm = {
+            "num_closed_trips": len(closed_trips),
+            "active_days": active_days,
+            "account_value": account_value,
+            "pnl_window": pnl_total_window,
+            "pnl_7d": pnl_7d,
+            "pnl_30d": pnl_30d,
+            "profit_factor": profit_factor,
+            "single_trade_share": single_share,
+            "win_rate": win_rate,
+            "roi_pct": roi_pct,
+            "max_drawdown_pct": max_dd_pct,
+            "had_liquidation": had_liquidation,
+        }
+        quality_pass, quality_reasons = quality_gate(qm)
+        score = quality_score(qm)
 
         return {
             "address": address,
@@ -300,6 +464,15 @@ def build_profile(address: str) -> dict:
             "num_closed_trips": len(closed_trips),
             "favorite_coins": favorite_coins,
             "open_positions": open_positions,
+            # --- Qualitaet ---
+            "score": score,
+            "quality_pass": quality_pass,
+            "quality_reasons": quality_reasons,
+            "active_days": round(active_days, 1),
+            "roi_pct": round(roi_pct, 1),
+            "max_drawdown_pct": round(max_dd_pct, 1),
+            "single_trade_share": round(single_share, 2),
+            "had_liquidation": had_liquidation,
         }
 
     except Exception as exc:  # noqa: BLE001 - pro Wallet kapseln, Scan nie abbrechen
